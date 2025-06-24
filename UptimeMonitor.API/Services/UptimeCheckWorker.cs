@@ -44,7 +44,7 @@ namespace UptimeMonitor.API.Services
                     if (!shouldRun) continue;
 
                     var start = now;
-                    var result = await SimulateCheckAsync(check);
+                    var result = await RunCheckAsync(check);
                     var end = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, limaTimeZone);
 
                     var newEvent = new UptimeEvent
@@ -64,7 +64,7 @@ namespace UptimeMonitor.API.Services
                             .Where(e => e.UptimeCheckId == check.Id && !e.IsUp)
                             .OrderByDescending(e => e.StartTime)
                             .Take(check.DownAlertResend)
-                            .ToListAsync();
+                            .ToListAsync(stoppingToken);
 
                         var firstDown = pastDowns.LastOrDefault();
 
@@ -87,21 +87,52 @@ namespace UptimeMonitor.API.Services
                 }
 
                 await db.SaveChangesAsync(stoppingToken);
-
                 await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
             }
         }
 
-        private async Task<(bool IsUp, string Note)> SimulateCheckAsync(UptimeCheck check)
+        private async Task<(bool IsUp, string Note)> RunCheckAsync(UptimeCheck check)
         {
-            await Task.Delay(200);
+            var isTestUrl = check.CheckUrl?.Contains("google.com", StringComparison.OrdinalIgnoreCase) == true;
 
-            var random = new Random();
-            bool isUp = random.NextDouble() < 0.8;
+            try
+            {
+                using var httpClient = new HttpClient
+                {
+                    Timeout = TimeSpan.FromSeconds(check.CheckTimeout)
+                };
 
-            return isUp
-                ? (true, "Simulated OK")
-                : (false, "Simulated DOWN - mock failure");
+                if (!string.IsNullOrWhiteSpace(check.RequestHeaders))
+                {
+                    var headers = check.RequestHeaders.Split("\n", StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var header in headers)
+                    {
+                        var parts = header.Split(":", 2);
+                        if (parts.Length == 2)
+                            httpClient.DefaultRequestHeaders.Add(parts[0].Trim(), parts[1].Trim());
+                    }
+                }
+
+                var response = await httpClient.GetAsync(check.CheckUrl);
+
+                if (isTestUrl)
+                {
+                    var random = new Random();
+                    var forceFailure = random.NextDouble() < 0.1;
+
+                    return forceFailure
+                        ? (false, "Simulated DOWN - forced failure on test URL")
+                        : (true, $"UP - HTTP {(int)response.StatusCode}");
+                }
+
+                return response.IsSuccessStatusCode
+                    ? (true, $"UP - HTTP {(int)response.StatusCode}")
+                    : (false, $"DOWN - HTTP {(int)response.StatusCode}");
+            }
+            catch (Exception ex)
+            {
+                return (false, $"DOWN - Exception: {ex.Message}");
+            }
         }
     }
 }
